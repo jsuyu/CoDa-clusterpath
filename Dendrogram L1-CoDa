@@ -1,0 +1,221 @@
+############################################################
+# Load required libraries
+############################################################
+library(coda.base)    #clr / olr coordinates
+library(CVXR)
+library(prodlim)
+############################################################
+# upload data
+############################################################
+set.seed(123)  # Optional, to make the random sampling reproducible
+my_data <- mammals_milk
+############################################################
+# coordinates
+############################################################
+comp_data<-as.matrix(my_data[,2:6])
+rownames(comp_data)<-my_data[,1]
+colnames(comp_data)<-colnames(my_data)[2:6]
+clr_data<-matrix(coordinates(comp_data,basis="clr"),nrow=nrow(comp_data))
+rownames(clr_data)<-my_data[,1]
+colnames(clr_data)<-colnames(my_data)[2:6]
+
+D<-ncol(clr_data)
+n_points<-nrow(clr_data)
+
+center_clr_data<-colMeans(clr_data)
+centered_data<-matrix(0, nrow = n_points, ncol = D)
+colnames(centered_data)<-colnames(clr_data)
+rownames(centered_data)<-my_data[,1]
+centered_data <- clr_data - matrix(rep(center_clr_data, each = n_points), nrow = n_points, byrow = FALSE)
+
+ilr_data<-coordinates(composition(centered_data,basis="clr"),basis="cdp")
+###########################################################
+# matrix of weights (choose phi and k)
+###########################################################
+phi<-0.5
+aux<-c()
+for(i in 1:(n_points-1)){
+  for(j in (i+1):n_points){
+    aux<-c(aux,i,j,exp(-phi*(dist(ilr_data[c(i,j), ], method = "euclidean"))^2))
+  }
+}
+W<-matrix(aux,ncol=3,byrow=TRUE)
+
+k<-4
+dist<-c()
+for(i in 1:(n_points)){
+  maux<-rbind(W[W[, 1] == i, ],W[W[, 2] == i, ])
+  dist[i]<-maux[order(maux[, 3], decreasing = TRUE), ][k,3]
+}
+
+for(i in 1:(n_points*(n_points-1)/2)){
+  if(W[i,3]<dist[W[i,1]] & W[i,3]<dist[W[i,2]]){W[i,3]<-0}
+}
+###########################################################
+# Optimisation problem: L1-CoDa
+###########################################################
+#sense pesos
+n.lambda<-100
+lambdamax<-0.08^(1/2)
+vector.lambda <- seq(0,lambdamax, length.out = n.lambda)
+#Gaussian kernel
+n.lambda<-100
+lambdamax<-0.83^(1/2)
+vector.lambda <- seq(0,lambdamax, length.out = n.lambda)
+#Gaussian kernel i k=4
+n.lambda<-100
+lambdamax<-4^(1/2)
+vector.lambda <- seq(0,lambdamax, length.out = n.lambda)
+
+# Initialize result matrices
+Result<-rep(0,n_points*D*n.lambda)
+dim(Result) = c(n_points,D,n.lambda)
+Result_ilr<-rep(0,n_points*(D-1)*n.lambda)
+dim(Result_ilr)=c(n_points,D-1,n.lambda)
+cost_f<-c(rep(0,2*n.lambda))
+dim(cost_f)=c(n.lambda,2)
+Median<-rep(0,n_points*(n_points-1)/2*n.lambda)
+dim(Median)=c(n_points*(n_points-1)/2,n.lambda)
+clusterinfo<-rep(0,n.lambda*n_points)
+dim(clusterinfo)=c(n_points,n.lambda)
+# Define matrices involned in penalty term
+G<-t(pairwise_basis(n_points))
+R<-matrix(1, nrow = 1, ncol = D)
+# Center log-ratio transformed data
+X_clr<-as.matrix(centered_data)
+class(X_clr) <- setdiff(class(X_clr), "coda")
+prev_sol<-Result[,,1]
+# Loop over lambda values
+for(i in 1:n.lambda){
+  U<-Variable(n_points,D)                                # Define optimization variables
+  M<-Variable(n_points*(n_points-1)/2,1)
+  loss <- (sum(((U-X_clr))^2))/2                           # Define loss function for CC
+  lasso <- (vector.lambda[i]^2)*sum(sweep(abs((G%*%U)-(M%*%R)),1,W[,3],'*'))             # penalty term
+  
+  obj <- loss + lasso                                    # Define the objective function
+  
+  
+  # Define and solve the optimization problem
+  prob<-Problem(Minimize(obj))
+  result <- solve(prob,solver='OSQP',reltol=1e-9,abstol=1e-9,feastol=1e-6,verbose=TRUE,num_iter=1000000)
+  # Store results
+  cost_f[i,1]<-result$value                              #obj
+  #Median[,i]<-result$getValue(M)
+  Median[,i]<-result$getValue(M)
+  aux<-result$getValue(U)
+  prev_sol<-aux
+  aux<-aux-rowSums(aux)
+  Result[,,i]<-composition(aux,basis="clr")              #compositional centers
+  Result_ilr[,,i]<-coordinates(Result[,,i])              #ilr-centers
+  aux1<-as.data.frame(round(aux,6))
+  aux2<-as.data.frame(unique(round(aux,6)))
+  clusterinfo[,i]<-row.match(aux1,aux2)
+  cost_f[i,2]<-nrow(aux2)                                #num of clusters
+}
+
+###########################################################
+# Dendrogram
+###########################################################
+historial<-list()
+merge<-c()
+height<-c()
+for (j in 1:n.lambda){
+  for (i in 1:max(clusterinfo[,j])){
+    string<-which(clusterinfo[,j]==i)
+    aux<-c()
+    auxhistorial<-list()
+    if(length(string)==1){
+      # Do nothing
+    } else {
+      #primer trenquem string en grups i fulles
+      kmax<-length(historial)
+      count<-0
+      if(kmax==0){
+        #Do nothing
+      } else {
+        for(k in rev(1:kmax)){
+          if(all(historial[[k]]%in%string)){
+            count<-count+1
+            aux[count]<-k
+            auxhistorial[[count]]<-historial[[k]]
+            string<-string[!string%in%historial[[k]]]
+          } else {
+            # Do nothing
+          }
+        }
+      }
+    }
+    #agreguem grups: merge, height, historial
+    if(length(aux)<2){
+      # Do nothing
+    } else {
+      if(length(aux)==2){
+        merge<-rbind(merge,c(aux[1],aux[2]))
+        historial<-append(historial,list(c(auxhistorial[[1]],auxhistorial[[2]])))
+        height<-c(height,vector.lambda[j])
+      } else {
+        merge<-rbind(merge,c(aux[1],aux[2]))
+        historial<-append(historial,list(c(auxhistorial[[1]],auxhistorial[[2]])))
+        height<-c(height,vector.lambda[j])
+        for(k in 3:(length(aux))){
+          merge<-rbind(merge,c(nrow(merge),aux[k]))
+          historial<-append(historial,list(c(historial[[length(historial)]],auxhistorial[[k]])))
+          height<-c(height,vector.lambda[j])
+        }
+      }
+    }
+    #agreguem fulles: merge, height, historial
+    if(length(string)==0){
+      # Do nothing
+    } else {
+      if(length(aux)==0){
+        if(length(string)==1){
+          # Do nothing
+        } else if(length(string)==2){
+          merge<-rbind(merge,c(-string[1],-string[2]))
+          historial<-append(historial,list(c(string[1],string[2])))
+          height<-c(height,vector.lambda[j])
+        } else {
+          merge<-rbind(merge,c(-string[1],-string[2]))
+          historial<-append(historial,list(c(string[1],string[2])))
+          height<-c(height,vector.lambda[j])
+          for(k in 3:(length(string))){
+            merge<-rbind(merge,c(nrow(merge),-string[k]))
+            historial<-append(historial,list(c(historial[[length(historial)]],string[k])))
+            height<-c(height,vector.lambda[j])
+          }
+        }
+      } else if(length(aux)==1){
+        if(length(string)==1){
+          merge<-rbind(merge,c(aux[1],-string[1]))
+          historial<-append(historial,list(c(auxhistorial[[1]],string[1])))
+          height<-c(height,vector.lambda[j])
+        } else{
+          merge<-rbind(merge,c(aux[1],-string[1]))
+          historial<-append(historial,list(c(auxhistorial[[1]],string[1])))
+          height<-c(height,vector.lambda[j])
+          for(k in 2:(length(string))){
+            merge<-rbind(merge,c(nrow(merge),-string[k]))
+            historial<-append(historial,list(c(historial[[length(historial)]],string[k])))
+            height<-c(height,vector.lambda[j])
+          }
+        }
+      } else {
+        for(k in 1:(length(string))){
+          merge<-rbind(merge,c(nrow(merge),-string[k]))
+          historial<-append(historial,list(c(historial[[length(historial)]],string[k])))
+          height<-c(height,vector.lambda[j])
+        }
+      }
+    }
+  } #tanco la i
+} #tanco la j
+order<-historial[[length(historial)]]
+hc<-list()
+hc$merge<-merge
+hc$height<-height^2
+hc$order<-order
+hc$labels<-my_data[,1]
+class(hc)<-"hclust"
+plot(hc, hang = -1, ylim = c(0, lambdamax), ylab = expression(Height ~ (lambda)))
+abline(h = seq(0, lambdamax^2, length.out = 11), col = "lightgrey", lty = "dotted")
